@@ -1,5 +1,6 @@
 import re
 import sys
+import time
 
 import pandas as pd
 
@@ -15,10 +16,18 @@ from src.fiscalia.parser import extraer_noticias
 from src.fiscalia.excel import (
     registrar_consulta,
     guardar_resultados,
-    _cargar_historial,
+    flush_historial,
+    cedulas_consultadas,
 )
 from src.utils.cedula import normalizar_cedula
-from src.utils.config import DASHBOARD_EXCEL
+from src.utils.seguridad import leer_excel_seguro, mask_cedula
+from src.utils.config import (
+    DASHBOARD_EXCEL,
+    ENMASCARAR_LOGS,
+    REINICIAR_NAVEGADOR_CADA,
+    REINTENTOS_PERSONA,
+    PAUSA_ENTRE_PERSONAS,
+)
 from src.utils.nombres import nombre_valido_para_busqueda
 from src.fiscalia.comparador_nombres import comparar_nombres
 
@@ -55,6 +64,11 @@ DELITOS_TRANSITO = [
     "COLISIÓN",
     "DAÑOS MATERIALES",
 ]
+
+
+def _cedula_log(cedula):
+    """Cédula para consola: enmascarada salvo que se desactive en config."""
+    return mask_cedula(cedula) if ENMASCARAR_LOGS else str(cedula)
 
 
 def limpiar_delito(delito):
@@ -130,8 +144,7 @@ def analizar_noticias(noticias, cedula, nombre, metodo):
 
 
 def procesar_persona(buscador, cedula, nombre):
-    print("\n------------------------------")
-    print("Cédula:", cedula)
+    print("Cédula:", _cedula_log(cedula))
     print("Nombre:", nombre)
 
     cedula_norm = normalizar_cedula(cedula)
@@ -158,26 +171,52 @@ def procesar_persona(buscador, cedula, nombre):
     return []
 
 
+def _procesar_con_reintentos(buscador, cedula, nombre):
+    """Reintenta ante fallos puntuales, reiniciando el navegador entre intentos."""
+    ultimo_error = None
+
+    for intento in range(1, REINTENTOS_PERSONA + 1):
+        try:
+            return procesar_persona(buscador, cedula, nombre)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            ultimo_error = e
+            print(f"⚠ Intento {intento}/{REINTENTOS_PERSONA} falló: {e}")
+            if intento < REINTENTOS_PERSONA:
+                buscador.reiniciar()
+
+    raise ultimo_error
+
+
+def _eta(inicio, hechas, restantes):
+    if hechas == 0:
+        return "?"
+    segundos = (time.time() - inicio) / hechas * restantes
+    return f"{int(segundos // 3600)}h {int(segundos % 3600 // 60):02d}m"
+
+
 def iniciar_proceso():
-    personas = pd.read_excel(DASHBOARD_EXCEL, dtype={"cedula": str})
+    personas = leer_excel_seguro(DASHBOARD_EXCEL, dtype={"cedula": str})
+    total = len(personas)
 
     print("==============================")
-    print("TOTAL PERSONAS:", len(personas))
+    print("TOTAL PERSONAS:", total)
     print("==============================")
 
-    # Historial en memoria (se carga una sola vez) para saltar en O(1)
-    # a las personas ya consultadas.
-    consultados = set(_cargar_historial()["cedula"].dropna().unique())
-    consultados.discard("")
+    consultados = cedulas_consultadas()
     print(f"📚 Historial cargado: {len(consultados)} personas ya consultadas.")
 
     buscador = BuscadorFiscalia()
     errores = []
+    procesadas = 0
+    busquedas = 0
+    inicio = time.time()
 
     try:
         buscador.iniciar()
 
-        for _, persona in personas.iterrows():
+        for i, (_, persona) in enumerate(personas.iterrows(), start=1):
             cedula = str(persona.get("cedula", "")).strip()
             nombre = str(persona.get("nombre", "")).strip()
 
@@ -186,26 +225,33 @@ def iniciar_proceso():
 
             cedula_norm = normalizar_cedula(cedula)
 
-            print("\nPROCESANDO")
-
             if not cedula_norm and not nombre_valido_para_busqueda(nombre):
-                print("⏭ Sin cédula ni nombre completo, se omite")
                 continue
 
             if cedula_norm and cedula_norm in consultados:
-                print("⏭ Ya consultado")
                 continue
 
-            # Un fallo puntual (red, cambio en la página) no debe abortar
-            # todo el proceso: se anota y se sigue con la siguiente persona.
+            print("\n------------------------------")
+            print(f"[{i}/{total}] procesadas: {procesadas}"
+                  f" | errores: {len(errores)}"
+                  f" | ETA: {_eta(inicio, procesadas, total - i)}")
+
+            # Reinicio preventivo del navegador en corridas largas
+            if busquedas > 0 and busquedas % REINICIAR_NAVEGADOR_CADA == 0:
+                buscador.reiniciar()
+
             try:
-                resultados = procesar_persona(buscador, cedula, nombre)
+                resultados = _procesar_con_reintentos(buscador, cedula, nombre)
             except KeyboardInterrupt:
+                print("\n⛔ Interrumpido por el usuario, guardando avance...")
                 raise
             except Exception as e:
-                print(f"❌ Error procesando {cedula} - {nombre}: {e}")
+                print(f"❌ Error procesando {_cedula_log(cedula)} - {nombre}: {e}")
                 errores.append((cedula, nombre, str(e)))
                 continue
+
+            busquedas += 1
+            procesadas += 1
 
             if resultados:
                 guardar_resultados(resultados)
@@ -215,14 +261,22 @@ def iniciar_proceso():
             registrar_consulta(cedula, nombre, "FINALIZADO")
             consultados.add(cedula_norm)
 
+            if PAUSA_ENTRE_PERSONAS:
+                time.sleep(PAUSA_ENTRE_PERSONAS / 1000)
+
     finally:
+        # Pase lo que pase: el avance pendiente queda en disco
+        flush_historial()
         buscador.cerrar()
 
+    print("\n==============================")
+    print(f"FIN: {procesadas} procesadas, {len(errores)} con error")
+    print("==============================")
+
     if errores:
-        print("\n==============================")
-        print(f"⚠️ {len(errores)} personas con error (se reintentan en la próxima corrida):")
+        print("⚠️ Personas con error (se reintentan en la próxima corrida):")
         for cedula, nombre, error in errores:
-            print(f"  - {cedula} {nombre}: {error}")
+            print(f"  - {_cedula_log(cedula)} {nombre}: {error}")
 
 
 if __name__ == "__main__":

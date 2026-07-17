@@ -83,7 +83,22 @@ class BuscadorFiscalia:
         return self._buscar(nombre)
 
     def cerrar(self):
-        if self.browser:
-            self.browser.close()
-        if self.playwright:
-            self.playwright.stop()
+        try:
+            if self.browser:
+                self.browser.close()
+        except Exception:
+            pass
+        try:
+            if self.playwright:
+                self.playwright.stop()
+        except Exception:
+            pass
+        self.browser = None
+        self.page = None
+        self.playwright = None
+
+    def reiniciar(self):
+        """Cierra y vuelve a abrir el navegador (corridas largas / recuperación de errores)."""
+        print("🔄 Reiniciando navegador...")
+        self.cerrar()
+        self.iniciar()

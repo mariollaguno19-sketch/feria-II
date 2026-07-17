@@ -4,8 +4,12 @@ from datetime import datetime
 
 try:
     from utils.cedula import normalizar_cedula
+    from utils.seguridad import leer_excel_seguro, guardar_excel_seguro
+    from utils.config import GUARDAR_CADA
 except ImportError:
     from src.utils.cedula import normalizar_cedula
+    from src.utils.seguridad import leer_excel_seguro, guardar_excel_seguro
+    from src.utils.config import GUARDAR_CADA
 
 
 # ==============================
@@ -47,60 +51,89 @@ COLUMNAS_RESULTADOS = [
 
 
 # ==============================
-# HISTORIAL (caché en memoria)
+# HISTORIAL (caché en memoria + escritura por lotes)
 # ==============================
 #
-# El historial se lee del disco UNA sola vez y luego se mantiene en
-# memoria; cada registro nuevo se agrega a la caché y se reescribe el
-# archivo (así el avance sobrevive a un corte a mitad del proceso).
+# El historial se lee del disco UNA sola vez. Los registros nuevos se
+# acumulan en memoria y se escriben a disco cada GUARDAR_CADA personas
+# (y siempre al final con flush_historial). Con ~3000 personas esto
+# reduce las escrituras de 3000 a ~300.
 
-_historial_cache = None
+_historial_filas = None      # list[dict]
+_historial_cedulas = None    # set[str] para búsqueda O(1)
+_pendientes = 0
 
 
 def _cargar_historial():
-    global _historial_cache
+    global _historial_filas, _historial_cedulas
 
-    if _historial_cache is not None:
-        return _historial_cache
+    if _historial_filas is not None:
+        return
 
     if os.path.exists(HISTORIAL):
-        df = pd.read_excel(HISTORIAL, dtype={"cedula": str})
+        df = leer_excel_seguro(HISTORIAL, dtype={"cedula": str})
         if "cedula" in df.columns:
             df["cedula"] = df["cedula"].apply(normalizar_cedula)
+            _historial_filas = df.to_dict("records")
         else:
-            df = pd.DataFrame(columns=COLUMNAS_HISTORIAL)
+            _historial_filas = []
     else:
-        df = pd.DataFrame(columns=COLUMNAS_HISTORIAL)
+        _historial_filas = []
 
-    _historial_cache = df
-    return _historial_cache
+    _historial_cedulas = {
+        f["cedula"] for f in _historial_filas if f.get("cedula")
+    }
+
+
+def cedulas_consultadas():
+    """Set de cédulas (normalizadas) ya consultadas."""
+    _cargar_historial()
+    return set(_historial_cedulas)
 
 
 def ya_consultado(cedula):
-    cedula = normalizar_cedula(cedula)
-    historial = _cargar_historial()
-    return cedula in historial["cedula"].values
+    _cargar_historial()
+    return normalizar_cedula(cedula) in _historial_cedulas
+
+
+def _escribir_historial():
+    df = pd.DataFrame(_historial_filas, columns=COLUMNAS_HISTORIAL)
+    df.drop_duplicates(subset=["cedula"], keep="last", inplace=True)
+    guardar_excel_seguro(df, HISTORIAL)
 
 
 def registrar_consulta(cedula, nombre, metodo="FINALIZADO"):
-    global _historial_cache
+    global _pendientes
 
-    registro = pd.DataFrame([{
-        "cedula": normalizar_cedula(cedula),
+    _cargar_historial()
+
+    cedula_norm = normalizar_cedula(cedula)
+
+    _historial_filas.append({
+        "cedula": cedula_norm,
         "nombre": nombre,
         "metodo": metodo,
         "fecha_consulta": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }])
+    })
+    if cedula_norm:
+        _historial_cedulas.add(cedula_norm)
 
-    historial = _cargar_historial()
+    _pendientes += 1
 
-    historial = pd.concat([historial, registro], ignore_index=True)
-    historial.drop_duplicates(subset=["cedula"], keep="last", inplace=True)
+    if _pendientes >= GUARDAR_CADA:
+        _escribir_historial()
+        _pendientes = 0
+        print("📝 Historial guardado a disco")
 
-    _historial_cache = historial
-    historial.to_excel(HISTORIAL, index=False)
 
-    print("📝 Consulta registrada en historial")
+def flush_historial():
+    """Escribe a disco lo pendiente. Llamar SIEMPRE al terminar."""
+    global _pendientes
+
+    if _historial_filas is not None and _pendientes > 0:
+        _escribir_historial()
+        _pendientes = 0
+        print("📝 Historial final guardado")
 
 
 # ==============================
@@ -134,7 +167,7 @@ def guardar_resultados(resultados):
     nuevo = pd.DataFrame(filas, columns=COLUMNAS_RESULTADOS)
 
     if os.path.exists(RESULTADOS):
-        actual = pd.read_excel(RESULTADOS, dtype={"cedula_dashboard": str})
+        actual = leer_excel_seguro(RESULTADOS, dtype={"cedula_dashboard": str})
         nuevo = pd.concat([actual, nuevo], ignore_index=True)
 
     nuevo.drop_duplicates(
@@ -143,6 +176,6 @@ def guardar_resultados(resultados):
         inplace=True,
     )
 
-    nuevo.to_excel(RESULTADOS, index=False)
+    guardar_excel_seguro(nuevo, RESULTADOS)
 
     print("✅ Resultados Fiscalía guardados")
