@@ -24,19 +24,12 @@ DATA_DIR = os.path.join(
 # ARCHIVO DEL DASHBOARD
 # ===============================
 
-# PRUEBA CON 5 REGISTROS
+# PRODUCCIÓN: procesa todas las personas del dashboard.
+# Para pruebas rápidas cambiar a "prueba_dashboard.xlsx" (5 registros).
 DASHBOARD_EXCEL = os.path.join(
     DATA_DIR,
     "registros_dashboard.xlsx"
 )
-
-
-# Cuando terminemos las pruebas
-# se cambia nuevamente a:
-#
-# registros_dashboard.xlsx
-#
-# para procesar las 857 personas.
 
 
 # ===============================

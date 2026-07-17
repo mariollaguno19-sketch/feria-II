@@ -10,3 +10,8 @@ env/
 .vscode/
 .history/
 *.log
+
+# Datos personales (cédulas, nombres, contactos) — NUNCA subir al repo
+AgroExpoBot/data/
+*.xlsx
+*.zip
